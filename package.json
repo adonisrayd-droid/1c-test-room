@@ -1,0 +1,13 @@
+{
+  "name": "mamka",
+  "version": "1.0.0",
+  "dependencies": {
+    "dotenv": "^18.0.7",
+    "express": "^5.2.1",
+    "express-session": "^1.18.1",
+    "sqlite3": "^6.0.1"
+  },
+  "allowScripts": {
+    "sqlite3@6.0.1": true
+  }
+}
