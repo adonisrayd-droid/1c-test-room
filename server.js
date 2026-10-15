@@ -13,17 +13,25 @@ if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 16) {
 }
 
 const app = express();
-app.set('trust proxy', 1); // сайт работает за Cloudflare Tunnel
+app.set('trust proxy', 1); // сайт работает за nginx (reverse proxy)
 
 const smallJson = express.json({ limit: '100kb' });
 const bigJson = express.json({ limit: '5mb' });
-const BIG_ROUTES = ['/api/questions', '/api/results/import'];
+const BIG_ROUTES = ['/api/questions', '/api/results', '/api/results/import', '/api/manual'];
 app.use((req, res, next) => (BIG_ROUTES.includes(req.path) ? next() : smallJson(req, res, next)));
 
 const TZ = process.env.TZ_NAME || 'Asia/Almaty';
-const VIDEO_DIR = path.join(__dirname, 'videos');
+// DATA_DIR — где хранятся база и видео. По умолчанию рядом с кодом.
+// На сервере удобно вынести отдельно, например DATA_DIR=/var/lib/mysite
+const DATA_DIR = path.resolve(process.env.DATA_DIR || __dirname);
+const VIDEO_DIR = path.join(DATA_DIR, 'videos');
 fs.mkdirSync(VIDEO_DIR, { recursive: true });
-const MAX_VIDEO_MB = 95; // у Cloudflare Tunnel лимит загрузки 100 МБ
+// Лимит должен быть не больше client_max_body_size в конфиге nginx
+const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB) || 95;
+// Картинки для инструкции по МИС
+const IMG_DIR = path.join(DATA_DIR, 'manual-images');
+fs.mkdirSync(IMG_DIR, { recursive: true });
+const MAX_IMAGE_MB = 5;
 const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
 
 // Заголовки безопасности
@@ -63,7 +71,9 @@ app.get(Object.keys(PUBLIC_FILES), (req, res) => {
     });
 });
 
-const db = new sqlite3.Database(path.join(__dirname, 'database.db'));
+const db = new sqlite3.Database(path.join(DATA_DIR, 'database.db'));
+db.run('PRAGMA journal_mode = WAL');
+db.run('PRAGMA busy_timeout = 5000');
 
 function hashPassword(password) {
     const salt = crypto.randomBytes(16).toString('hex');
@@ -105,9 +115,16 @@ db.serialize(() => {
             totalCount INTEGER,
             percentage INTEGER,
             passed INTEGER,
-            created_at INTEGER
+            created_at INTEGER,
+            details TEXT
         )
     `);
+    // Для старых баз: добавляем колонку с разбором ответов
+    db.all('PRAGMA table_info(results)', [], (err, cols) => {
+        if (!err && cols && !cols.some(c => c.name === 'details')) {
+            db.run('ALTER TABLE results ADD COLUMN details TEXT');
+        }
+    });
     db.run(`
         CREATE TABLE IF NOT EXISTS videos (
             id TEXT PRIMARY KEY,
@@ -187,11 +204,13 @@ function requireAdmin(req, res, next) {
 }
 
 // --- Ограничение попыток входа (защита от подбора пароля) ---
+const MIN_PASSWORD = 8;
 const attempts = new Map();
 const MAX_ATTEMPTS = 8;
 const WINDOW_MS = 15 * 60 * 1000;
 function clientKey(req) {
-    return req.headers['cf-connecting-ip'] || req.ip;
+    // req.ip берётся из X-Forwarded-For, который выставляет nginx (trust proxy)
+    return req.ip;
 }
 function isBlocked(key) {
     const a = attempts.get(key);
@@ -263,8 +282,8 @@ app.post('/api/users', requireAdmin, (req, res) => {
     if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password) {
         return res.status(400).json({ error: 'Имя пользователя и пароль обязательны' });
     }
-    if (password.length < 4) {
-        return res.status(400).json({ error: 'Пароль слишком короткий (минимум 4 символа)' });
+    if (password.length < MIN_PASSWORD) {
+        return res.status(400).json({ error: 'Пароль слишком короткий (минимум ' + MIN_PASSWORD + ' символов)' });
     }
 
     const trimmedUsername = username.trim();
@@ -304,8 +323,8 @@ app.put('/api/users/:username', requireAdmin, (req, res) => {
         const newRole = role ? (role === 'admin' ? 'admin' : 'user') : user.role;
         let newPasswordHash = user.password;
         if (typeof password === 'string' && password.trim().length > 0) {
-            if (password.trim().length < 4) {
-                return res.status(400).json({ error: 'Пароль слишком короткий (минимум 4 символа)' });
+            if (password.trim().length < MIN_PASSWORD) {
+                return res.status(400).json({ error: 'Пароль слишком короткий (минимум ' + MIN_PASSWORD + ' символов)' });
             }
             newPasswordHash = hashPassword(password.trim());
         }
@@ -402,8 +421,33 @@ function rowToResult(r) {
         correctCount: r.correctCount,
         totalCount: r.totalCount,
         percentage: r.percentage,
-        passed: !!r.passed
+        passed: !!r.passed,
+        hasDetails: !!r.hasDetails
     };
+}
+
+// Разбор ответов по вопросам: проверяем формат и ограничиваем размер
+function cleanDetails(d) {
+    if (!Array.isArray(d) || d.length === 0 || d.length > 500) return null;
+    const out = [];
+    for (const q of d) {
+        if (!q || typeof q !== 'object' || !Array.isArray(q.options) || q.options.length > 30) return null;
+        const options = q.options.map(o => ({
+            text: String((o && o.text) || '').slice(0, 1000),
+            correct: !!(o && o.correct),
+            chosen: !!(o && o.chosen)
+        }));
+        out.push({
+            id: String(q.id || '').slice(0, 100),
+            text: String(q.text || '').slice(0, 2000),
+            points: cleanNumber(q.points, 100000) || 0,
+            isCorrect: options.every(o => o.correct === o.chosen),
+            videoId: typeof q.videoId === 'string' && VIDEO_ID_RE.test(q.videoId) ? q.videoId : null,
+            options
+        });
+    }
+    const json = JSON.stringify(out);
+    return json.length <= 500000 ? json : null;
 }
 
 function cleanNumber(v, max) {
@@ -432,16 +476,17 @@ function buildResult(b) {
 
 app.get('/api/results', requireAuth, (req, res) => {
     const isAdmin = req.session.user.role === 'admin';
+    const cols = 'id, username, theme, date, earnedScore, maxScore, correctCount, totalCount, percentage, passed, created_at, (details IS NOT NULL) AS hasDetails';
     const sql = isAdmin
-        ? 'SELECT * FROM results ORDER BY created_at ASC'
-        : 'SELECT * FROM results WHERE LOWER(username) = LOWER(?) ORDER BY created_at ASC';
+        ? `SELECT ${cols} FROM results ORDER BY created_at ASC`
+        : `SELECT ${cols} FROM results WHERE LOWER(username) = LOWER(?) ORDER BY created_at ASC`;
     db.all(sql, isAdmin ? [] : [req.session.user.username], (err, rows) => {
         if (err) return serverError(res, err);
         res.json(rows.map(rowToResult));
     });
 });
 
-app.post('/api/results', requireAuth, (req, res) => {
+app.post('/api/results', requireAuth, bigJson, (req, res) => {
     const r = buildResult(req.body || {});
     if (!r) return res.status(400).json({ error: 'Неверные данные результата' });
 
@@ -449,16 +494,33 @@ app.post('/api/results', requireAuth, (req, res) => {
     const id = 'res_' + now.getTime() + '_' + crypto.randomBytes(3).toString('hex');
     const username = req.session.user.username; // имя берётся из сессии, а не от клиента
     const date = formatDate(now);
+    const details = cleanDetails(req.body.details);
 
     db.run(
-        `INSERT INTO results (id, username, theme, date, earnedScore, maxScore, correctCount, totalCount, percentage, passed, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, username, r.theme, date, r.earnedScore, r.maxScore, r.correctCount, r.totalCount, r.percentage, r.passed, now.getTime()],
+        `INSERT INTO results (id, username, theme, date, earnedScore, maxScore, correctCount, totalCount, percentage, passed, created_at, details)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, username, r.theme, date, r.earnedScore, r.maxScore, r.correctCount, r.totalCount, r.percentage, r.passed, now.getTime(), details],
         err => {
             if (err) return serverError(res, err);
-            res.status(201).json({ success: true, result: rowToResult({ id, username, date, ...r }) });
+            res.status(201).json({ success: true, result: rowToResult({ id, username, date, ...r, hasDetails: !!details }) });
         }
     );
+});
+
+// Один результат с разбором ответов: видит владелец или администратор
+app.get('/api/results/:id', requireAuth, (req, res) => {
+    if (!/^[a-z0-9_]{1,80}$/i.test(req.params.id)) return res.status(400).json({ error: 'Неверный id' });
+    db.get('SELECT * FROM results WHERE id = ?', [req.params.id], (err, row) => {
+        if (err) return serverError(res, err);
+        if (!row) return res.status(404).json({ error: 'Результат не найден' });
+        const isAdmin = req.session.user.role === 'admin';
+        if (!isAdmin && String(row.username).toLowerCase() !== req.session.user.username.toLowerCase()) {
+            return res.status(403).json({ error: 'Недостаточно прав' });
+        }
+        let details = null;
+        if (row.details) { try { details = JSON.parse(row.details); } catch (e) { details = null; } }
+        res.json({ result: rowToResult({ ...row, hasDetails: !!row.details }), details });
+    });
 });
 
 // Однократный перенос старых результатов из браузера администратора
@@ -622,7 +684,133 @@ app.delete('/api/videos/:id', requireAdmin, (req, res) => {
     });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server started: http://localhost:${PORT}`);
+// ============================================================
+// Инструкция по МИС и схема связи (редактирует администратор)
+// ============================================================
+const SECTION_ID_RE = /^[a-z0-9_-]{1,60}$/i;
+const IMAGE_FILE_RE = /^img_[a-z0-9_]{1,80}\.(png|jpg|gif|webp)$/;
+
+function cleanManual(m) {
+    if (!m || !Array.isArray(m.sections) || m.sections.length > 200) return null;
+    const sections = [];
+    const seen = new Set();
+    for (const s of m.sections) {
+        if (!s || typeof s.id !== 'string' || !SECTION_ID_RE.test(s.id) || seen.has(s.id)) return null;
+        if (!Array.isArray(s.blocks) || s.blocks.length > 100) return null;
+        seen.add(s.id);
+        const blocks = [];
+        for (const b of s.blocks) {
+            if (!b || typeof b !== 'object') return null;
+            if (b.type === 'text') {
+                blocks.push({ type: 'text', text: String(b.text || '').slice(0, 20000) });
+            } else if (b.type === 'image') {
+                if (typeof b.file !== 'string' || !IMAGE_FILE_RE.test(b.file)) return null;
+                blocks.push({ type: 'image', file: b.file, caption: String(b.caption || '').slice(0, 300) });
+            } else if (b.type === 'diagram') {
+                blocks.push({ type: 'diagram' });
+            } else {
+                return null;
+            }
+        }
+        const tags = Array.isArray(s.tags)
+            ? s.tags.filter(t => typeof t === 'string').map(t => t.trim().slice(0, 40)).filter(Boolean).slice(0, 20)
+            : [];
+        sections.push({ id: s.id, title: String(s.title || '').trim().slice(0, 200), tags, blocks });
+    }
+    return { sections };
+}
+
+app.get('/api/manual', requireAuth, (req, res) => {
+    db.get("SELECT value FROM app_data WHERE key = 'manual'", [], (err, row) => {
+        if (err) return serverError(res, err);
+        let manual = null;
+        if (row) { try { manual = JSON.parse(row.value); } catch (e) { manual = null; } }
+        res.json({ manual });
+    });
 });
+
+app.put('/api/manual', requireAdmin, bigJson, (req, res) => {
+    const manual = cleanManual(req.body);
+    if (!manual) return res.status(400).json({ error: 'Неверный формат инструкции' });
+    db.run(
+        "INSERT INTO app_data (key, value) VALUES ('manual', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [JSON.stringify(manual)],
+        err => {
+            if (err) return serverError(res, err);
+            res.json({ success: true });
+            cleanupManualImages(manual);
+        }
+    );
+});
+
+// Удаляем картинки, которых больше нет в инструкции (свежие файлы не трогаем)
+function cleanupManualImages(manual) {
+    const used = new Set();
+    manual.sections.forEach(s => s.blocks.forEach(b => { if (b.type === 'image') used.add(b.file); }));
+    fs.readdir(IMG_DIR, (err, files) => {
+        if (err) return;
+        files.forEach(f => {
+            if (used.has(f)) return;
+            const full = path.join(IMG_DIR, f);
+            fs.stat(full, (e, st) => {
+                if (!e && Date.now() - st.mtimeMs > 60 * 60 * 1000) fs.unlink(full, () => {});
+            });
+        });
+    });
+}
+
+function detectImageExt(buf) {
+    if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+    if (buf.toString('ascii', 0, 4) === 'GIF8') return 'gif';
+    if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+    return null;
+}
+
+const imageBody = express.raw({
+    type: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+    limit: MAX_IMAGE_MB + 'mb'
+});
+
+app.post('/api/manual/images', requireAdmin, imageBody, (req, res) => {
+    const ext = detectImageExt(req.body);
+    if (!ext) return res.status(400).json({ error: 'Допустимы только картинки PNG, JPG, GIF, WebP' });
+    const file = 'img_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex') + '.' + ext;
+    fs.writeFile(path.join(IMG_DIR, file), req.body, err => {
+        if (err) return serverError(res, err);
+        res.status(201).json({ success: true, file });
+    });
+});
+
+app.get('/api/manual/images/:file', requireAuth, (req, res) => {
+    if (!IMAGE_FILE_RE.test(req.params.file)) return res.status(400).end();
+    res.sendFile(path.join(IMG_DIR, req.params.file), { headers: { 'Cache-Control': 'private, max-age=86400' } }, e => {
+        if (e && !res.headersSent) res.status(404).end();
+    });
+});
+
+// Ошибки разбора запросов (слишком большой файл, неверный JSON) возвращаем в JSON
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    const status = err.status || err.statusCode || 500;
+    if (status === 413) return res.status(413).json({ error: 'Слишком большой файл или запрос' });
+    if (status >= 400 && status < 500) return res.status(status).json({ error: 'Неверный запрос' });
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка сервера' });
+});
+
+const PORT = process.env.PORT || 3000;
+// Слушаем только localhost: наружу сайт отдаёт nginx
+const HOST = process.env.HOST || '127.0.0.1';
+const server = app.listen(PORT, HOST, () => {
+    console.log(`Server started: http://${HOST}:${PORT}`);
+});
+
+// Корректная остановка при `systemctl restart/stop`
+function shutdown() {
+    server.close(() => db.close(() => process.exit(0)));
+    setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

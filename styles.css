@@ -1192,3 +1192,47 @@ body {
 .toast.error {
     border-left-color: var(--error);
 }
+
+/* ===== Инструкция: картинки и кнопки редактора ===== */
+.manual-img-wrap { margin: 16px 0; text-align: center; }
+.manual-img-wrap img { max-width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border-color); }
+.manual-img-caption { margin-top: 6px; font-size: 12px; color: var(--text-muted); }
+.manual-admin-actions { display: flex; gap: 6px; margin-left: auto; }
+.manual-block-edit {
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.manual-block-edit img { max-width: 100%; max-height: 220px; border-radius: 8px; align-self: flex-start; }
+.manual-block-bar { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.manual-block-bar .spacer { flex: 1; }
+
+/* ===== Разбор ответов ===== */
+.review-q {
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    padding: 18px;
+    background: var(--bg-secondary);
+}
+.review-q.is-wrong { border-color: var(--error); }
+.review-q.is-right { border-color: var(--success); }
+.review-q-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; align-items: flex-start; }
+.review-q-text { font-size: 15px; font-weight: 600; line-height: 1.5; }
+.review-opt {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    margin-top: 8px;
+    font-size: 14px;
+}
+.review-opt.correct { border-color: var(--success); background: rgba(46, 196, 182, 0.10); }
+.review-opt.wrong { border-color: var(--error); background: rgba(230, 57, 70, 0.10); }
+.review-opt .tag { margin-left: auto; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.review-opt.correct .tag { color: var(--success); }
+.review-opt.wrong .tag { color: var(--error); }

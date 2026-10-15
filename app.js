@@ -273,6 +273,10 @@ let editingUserUsername = null;
 
 // Video library state (metadata in localStorage, blobs in IndexedDB)
 let videoMeta = []; // [{id, title, desc, fileName, size}]
+let manualSections = null; // разделы инструкции с сервера (null = стандартные)
+let manualEdit = null;     // раздел, который сейчас редактируется
+let reviewState = null;    // {result, details, from} для экрана разбора
+let lastReview = null;     // разбор только что пройденного теста
 let videoDB = null; // IndexedDB instance
 let pendingVideoBlob = null; // temp blob while filling add form
 
@@ -307,10 +311,11 @@ async function jsonOrNull(response) {
 
 async function loadServerData() {
     try {
-        const [qRes, rRes, vRes] = await Promise.all([
+        const [qRes, rRes, vRes, mRes] = await Promise.all([
             fetch('/api/questions'),
             fetch('/api/results'),
-            fetch('/api/videos')
+            fetch('/api/videos'),
+            fetch('/api/manual')
         ]);
 
         if (qRes.status === 401) {
@@ -335,6 +340,10 @@ async function loadServerData() {
         if (vRes.ok) {
             const data = await jsonOrNull(vRes);
             if (Array.isArray(data)) videoMeta = data;
+        }
+        if (mRes.ok) {
+            const data = await jsonOrNull(mRes);
+            manualSections = (data && data.manual && Array.isArray(data.manual.sections)) ? data.manual.sections : null;
         }
         if (currentUser && currentUser.role === 'admin') {
             await loadUsers();
@@ -493,6 +502,7 @@ function initUserSession() {
         document.getElementById("nav-users").style.display = "flex";
         document.getElementById("nav-results").style.display = "flex";
         document.getElementById("video-admin-toolbar").style.display = "flex";
+        document.getElementById("manual-admin-toolbar").style.display = "inline-flex";
         document.getElementById("video-empty-hint").textContent = "Нажмите «Загрузить видео» выше, чтобы добавить первый ролик.";
     } else {
         roleEl.textContent = "Тестируемый";
@@ -502,6 +512,7 @@ function initUserSession() {
         document.getElementById("nav-questions").style.display = "none";
         document.getElementById("nav-users").style.display = "none";
         document.getElementById("nav-results").style.display = "none";
+        document.getElementById("manual-admin-toolbar").style.display = "none";
     }
     
     // Default screen: instructions
@@ -559,12 +570,18 @@ function switchScreen(screenId) {
         'questions': 'База вопросов и тем',
         'users': 'Управление пользователями (Администрирование)',
         'results': 'Все результаты тестирования',
-        'videos': 'Видеотека — Обучающие материалы'
+        'videos': 'Видеотека — Обучающие материалы',
+        'myresults': 'Мои результаты',
+        'review': 'Разбор ответов'
     };
     document.getElementById("screen-title").textContent = titles[screenId] || '';
     
     if (screenId === 'dashboard') {
         renderDashboard();
+    } else if (screenId === 'instructions') {
+        renderManual();
+    } else if (screenId === 'myresults') {
+        renderMyResults();
     } else if (screenId === 'questions') {
         renderQuestionsList();
     } else if (screenId === 'users') {
@@ -576,12 +593,14 @@ function switchScreen(screenId) {
     }
 
     // Подтягиваем свежие данные с сервера (чтобы все видели одно и то же)
-    if (currentUser && ['dashboard', 'questions', 'users', 'results', 'videos'].includes(screenId)) {
+    if (currentUser && ['dashboard', 'instructions', 'myresults', 'questions', 'users', 'results', 'videos'].includes(screenId)) {
         loadServerData().then(() => {
             if (!currentUser) return;
             const el = document.getElementById(`screen-${screenId}`);
             if (!el || !el.classList.contains('active')) return;
             if (screenId === 'dashboard') renderDashboard();
+            else if (screenId === 'instructions') renderManual();
+            else if (screenId === 'myresults') renderMyResults();
             else if (screenId === 'questions') renderQuestionsList();
             else if (screenId === 'users') renderUsersList();
             else if (screenId === 'results') renderResultsList();
@@ -606,55 +625,296 @@ function toggleTheme() {
     }
 }
 
-// --- Render MIS Manual ---
+// --- Инструкция по МИС (разделы хранятся на сервере, редактирует администратор) ---
+function formatManualText(text) {
+    let t = escapeHtml(text);
+    t = t.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+    t = t.replace(/\n/g, '<br>');
+    t = t.replace(/\u26A0\uFE0F?/g, '<span style="color: var(--warning);"><i class="fa-solid fa-triangle-exclamation"></i></span>');
+    return t;
+}
+
+// Стандартная инструкция (пока администратор ничего не менял)
+function buildDefaultManual() {
+    const conv = t => t.replace(/<\/?b>/g, '**');
+    const sections = [{
+        id: 'scheme',
+        title: 'Визуальная схема связи документов (Связка МИС)',
+        tags: ['схема', 'связка', 'документы'],
+        blocks: [{ type: 'diagram' }]
+    }];
+    MANUAL_SECTIONS.forEach(sec => {
+        sections.push({ id: sec.id, title: sec.title, tags: sec.tags.slice(), blocks: [{ type: 'text', text: conv(sec.text) }] });
+    });
+    return sections;
+}
+
+function getManualSections() {
+    return manualSections || buildDefaultManual();
+}
+
+function renderManualBlock(b) {
+    if (b.type === 'text') {
+        return `<div style="font-size: 14px; line-height: 1.6; color: var(--text-primary); margin-bottom: 10px;">${formatManualText(b.text)}</div>`;
+    }
+    if (b.type === 'image') {
+        const cap = b.caption ? `<div class="manual-img-caption">${escapeHtml(b.caption)}</div>` : '';
+        return `<div class="manual-img-wrap"><img src="/api/manual/images/${encodeURIComponent(b.file)}" alt="${escapeHtml(b.caption || '')}" loading="lazy">${cap}</div>`;
+    }
+    if (b.type === 'diagram') {
+        const tpl = document.getElementById('tpl-scheme-diagram');
+        return tpl ? tpl.innerHTML : '';
+    }
+    return '';
+}
+
 function renderManual() {
     const container = document.getElementById("manual-sections-container");
     container.innerHTML = "";
-    
-    MANUAL_SECTIONS.forEach(sec => {
+    const isAdmin = !!(currentUser && currentUser.role === 'admin');
+    const sections = getManualSections();
+
+    if (sections.length === 0) {
+        container.innerHTML = `<div style="color: var(--text-muted); text-align: center; padding: 40px;">Инструкция пуста.${isAdmin ? ' Нажмите «Добавить раздел».' : ''}</div>`;
+        return;
+    }
+
+    sections.forEach((sec, idx) => {
         const card = document.createElement("div");
         card.className = "panel-card manual-section-card";
         card.id = `manual-${sec.id}`;
-        card.dataset.tags = sec.tags.join(" ");
-        
-        let formattedText = sec.text.replace(/\n/g, "<br>");
-        
-        // Highlight warning markers
-        formattedText = formattedText.replace(/⚠️/g, '<span style="color: var(--warning);"><i class="fa-solid fa-triangle-exclamation"></i></span>');
-        
+        card.dataset.tags = (sec.tags || []).join(" ");
+
+        const hasDiagram = sec.blocks.some(b => b.type === 'diagram');
+        const icon = hasDiagram ? 'fa-diagram-project' : 'fa-circle-info';
+        const sid = escapeHtml(sec.id);
+        const adminHtml = isAdmin ? `
+            <div class="manual-admin-actions">
+                <button class="btn-icon" title="Выше" onclick="moveManualSection('${sid}', -1)" ${idx === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up"></i></button>
+                <button class="btn-icon" title="Ниже" onclick="moveManualSection('${sid}', 1)" ${idx === sections.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down"></i></button>
+                <button class="btn-icon" title="Редактировать" onclick="openManualModal('${sid}')"><i class="fa-solid fa-pen-to-square"></i></button>
+                <button class="btn-icon btn-icon-danger" title="Удалить раздел" onclick="deleteManualSection('${sid}')"><i class="fa-solid fa-trash-can"></i></button>
+            </div>` : '';
+
+        const tagsHtml = (sec.tags || []).length
+            ? `<div style="display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap;">${sec.tags.map(t => `<span class="badge" style="background: rgba(255,255,255,0.05); color: var(--text-secondary); font-size: 9px;">#${escapeHtml(t)}</span>`).join("")}</div>`
+            : '';
+
         card.innerHTML = `
             <div class="panel-header" style="border-bottom: 1px solid var(--border-color); padding-bottom: 12px; margin-bottom: 12px;">
                 <h3 class="panel-title" style="color: var(--accent-gold); font-size: 17px;">
-                    <i class="fa-solid fa-circle-info" style="color: var(--accent-orange);"></i>
-                    ${sec.title}
+                    <i class="fa-solid ${icon}" style="color: var(--accent-orange);"></i>
+                    ${escapeHtml(sec.title || '(без названия)')}
                 </h3>
+                ${adminHtml}
             </div>
-            <div style="font-size: 14px; line-height: 1.6; color: var(--text-primary);">
-                ${formattedText}
-            </div>
-            <div style="display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap;">
-                ${sec.tags.map(t => `<span class="badge" style="background: rgba(255,255,255,0.05); color: var(--text-secondary); font-size: 9px;">#${t}</span>`).join("")}
-            </div>
+            <div class="manual-blocks">${sec.blocks.map(renderManualBlock).join('')}</div>
+            ${tagsHtml}
         `;
         container.appendChild(card);
     });
+    filterManual();
 }
 
 function filterManual() {
-    const searchVal = document.getElementById("search-manual-input").value.trim().toLowerCase();
-    const cards = document.querySelectorAll(".manual-section-card");
-    
-    cards.forEach(card => {
-        const titleText = card.querySelector(".panel-title").textContent.toLowerCase();
-        const contentText = card.querySelector("div").textContent.toLowerCase();
-        const tagsText = card.dataset.tags.toLowerCase();
-        
-        if (titleText.includes(searchVal) || contentText.includes(searchVal) || tagsText.includes(searchVal)) {
-            card.style.display = "flex";
-        } else {
-            card.style.display = "none";
-        }
+    const searchEl = document.getElementById("search-manual-input");
+    const searchVal = searchEl ? searchEl.value.trim().toLowerCase() : '';
+    document.querySelectorAll(".manual-section-card").forEach(card => {
+        const hay = (card.textContent + " " + (card.dataset.tags || "")).toLowerCase();
+        card.style.display = hay.includes(searchVal) ? "flex" : "none";
     });
+}
+
+// --- Редактор инструкции (только администратор) ---
+async function persistManual(sections) {
+    try {
+        const r = await fetch('/api/manual', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sections })
+        });
+        if (!r.ok) {
+            const d = await jsonOrNull(r);
+            showToast((d && d.error) || "Не удалось сохранить инструкцию", "error");
+            return false;
+        }
+        manualSections = sections;
+        renderManual();
+        showToast("Инструкция сохранена", "success");
+        return true;
+    } catch (e) {
+        showToast("Ошибка связи с сервером", "error");
+        return false;
+    }
+}
+
+function openManualModal(sectionId = null) {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    const found = sectionId ? getManualSections().find(x => x.id === sectionId) : null;
+    manualEdit = found
+        ? JSON.parse(JSON.stringify(found))
+        : { id: null, title: '', tags: [], blocks: [{ type: 'text', text: '' }] };
+    document.getElementById('manual-modal-title').textContent = found ? 'Редактирование раздела' : 'Новый раздел';
+    document.getElementById('manual-edit-title').value = manualEdit.title;
+    document.getElementById('manual-edit-tags').value = (manualEdit.tags || []).join(', ');
+    renderManualBlocksEditor();
+    document.getElementById('modal-manual-overlay').classList.add('active');
+}
+
+function closeManualModal() {
+    document.getElementById('modal-manual-overlay').classList.remove('active');
+    manualEdit = null;
+}
+
+function renderManualBlocksEditor() {
+    const box = document.getElementById('manual-blocks-editor');
+    box.innerHTML = '';
+    manualEdit.blocks.forEach((b, i) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'manual-block-edit';
+
+        const labels = { text: 'Текст', image: 'Картинка', diagram: 'Схема связи документов (встроенная)' };
+        const bar = document.createElement('div');
+        bar.className = 'manual-block-bar';
+        bar.innerHTML = `
+            <span>${labels[b.type] || b.type}</span>
+            <span class="spacer"></span>
+            <button class="btn-icon" title="Выше" onclick="moveManualBlock(${i}, -1)" ${i === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up"></i></button>
+            <button class="btn-icon" title="Ниже" onclick="moveManualBlock(${i}, 1)" ${i === manualEdit.blocks.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down"></i></button>
+            <button class="btn-icon btn-icon-danger" title="Удалить блок" onclick="removeManualBlock(${i})"><i class="fa-solid fa-trash-can"></i></button>
+        `;
+        wrap.appendChild(bar);
+
+        if (b.type === 'text') {
+            const ta = document.createElement('textarea');
+            ta.className = 'form-input';
+            ta.style.cssText = 'height: 160px; padding: 12px 16px; resize: vertical;';
+            ta.placeholder = 'Текст раздела...';
+            ta.value = b.text || '';
+            ta.addEventListener('input', () => { manualEdit.blocks[i].text = ta.value; });
+            wrap.appendChild(ta);
+        } else if (b.type === 'image') {
+            const img = document.createElement('img');
+            img.src = `/api/manual/images/${encodeURIComponent(b.file)}`;
+            img.alt = '';
+            wrap.appendChild(img);
+            const cap = document.createElement('input');
+            cap.type = 'text';
+            cap.className = 'form-input';
+            cap.style.paddingLeft = '16px';
+            cap.maxLength = 300;
+            cap.placeholder = 'Подпись под картинкой (необязательно)';
+            cap.value = b.caption || '';
+            cap.addEventListener('input', () => { manualEdit.blocks[i].caption = cap.value; });
+            wrap.appendChild(cap);
+        } else if (b.type === 'diagram') {
+            const note = document.createElement('div');
+            note.style.cssText = 'font-size: 13px; color: var(--text-secondary);';
+            note.textContent = 'Стандартная схема «Заявка → Приём → Оказание услуг». Её можно удалить кнопкой справа и добавить свой текст или картинку.';
+            wrap.appendChild(note);
+        }
+        box.appendChild(wrap);
+    });
+    if (manualEdit.blocks.length === 0) {
+        box.innerHTML = '<div style="font-size: 13px; color: var(--text-muted);">Блоков нет. Добавьте текст или картинку.</div>';
+    }
+}
+
+function addManualTextBlock() {
+    if (!manualEdit) return;
+    manualEdit.blocks.push({ type: 'text', text: '' });
+    renderManualBlocksEditor();
+    const areas = document.querySelectorAll('#manual-blocks-editor textarea');
+    if (areas.length) areas[areas.length - 1].focus();
+}
+
+function moveManualBlock(i, dir) {
+    const j = i + dir;
+    if (!manualEdit || j < 0 || j >= manualEdit.blocks.length) return;
+    const tmp = manualEdit.blocks[i];
+    manualEdit.blocks[i] = manualEdit.blocks[j];
+    manualEdit.blocks[j] = tmp;
+    renderManualBlocksEditor();
+}
+
+function removeManualBlock(i) {
+    if (!manualEdit) return;
+    manualEdit.blocks.splice(i, 1);
+    renderManualBlocksEditor();
+}
+
+async function onManualImageChosen(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file || !manualEdit) return;
+    const okTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+    if (!okTypes.includes(file.type)) {
+        showToast("Допустимы только PNG, JPG, GIF, WebP", "error");
+        return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+        showToast("Картинка больше 5 МБ. Уменьшите её", "error");
+        return;
+    }
+    try {
+        const r = await fetch('/api/manual/images', {
+            method: 'POST',
+            headers: { 'Content-Type': file.type },
+            body: file
+        });
+        const d = await jsonOrNull(r);
+        if (!r.ok || !d || !d.file) {
+            showToast((d && d.error) || "Не удалось загрузить картинку", "error");
+            return;
+        }
+        if (!manualEdit) return;
+        manualEdit.blocks.push({ type: 'image', file: d.file, caption: '' });
+        renderManualBlocksEditor();
+    } catch (e) {
+        showToast("Ошибка связи с сервером", "error");
+    }
+}
+
+async function saveManualSection() {
+    if (!manualEdit) return;
+    const title = document.getElementById('manual-edit-title').value.trim();
+    if (!title) {
+        showToast("Введите заголовок раздела", "error");
+        return;
+    }
+    const tags = document.getElementById('manual-edit-tags').value
+        .split(',').map(t => t.trim()).filter(Boolean);
+    const blocks = manualEdit.blocks.filter(b => b.type !== 'text' || (b.text || '').trim() !== '');
+
+    const sections = JSON.parse(JSON.stringify(getManualSections()));
+    const sec = {
+        id: manualEdit.id || ('sec_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
+        title, tags, blocks
+    };
+    const idx = sections.findIndex(x => x.id === sec.id);
+    if (idx >= 0) sections[idx] = sec; else sections.push(sec);
+
+    if (await persistManual(sections)) closeManualModal();
+}
+
+async function deleteManualSection(id) {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    if (!confirm("Удалить этот раздел инструкции?")) return;
+    const sections = getManualSections().filter(x => x.id !== id);
+    await persistManual(sections);
+}
+
+async function moveManualSection(id, dir) {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    const sections = JSON.parse(JSON.stringify(getManualSections()));
+    const i = sections.findIndex(x => x.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= sections.length) return;
+    const tmp = sections[i];
+    sections[i] = sections[j];
+    sections[j] = tmp;
+    await persistManual(sections);
 }
 
 // --- Dashboard ---
@@ -702,7 +962,7 @@ function renderDashboard() {
             
             card.innerHTML = `
                 <div class="theme-info">
-                    <span class="theme-name">${themeName}</span>
+                    <span class="theme-name">${escapeHtml(themeName)}</span>
                     <div class="theme-stats">
                         <span><i class="fa-solid fa-list-ol"></i> ${questionCount} вопр.</span>
                         <span><i class="fa-solid fa-clock"></i> 5 мин.</span>
@@ -882,7 +1142,7 @@ function renderCurrentQuestion() {
             <div class="selector-circle">
                 <div class="selector-inner"></div>
             </div>
-            <span style="font-size: 15px; font-weight: 500;">${opt.text}</span>
+            <span style="font-size: 15px; font-weight: 500;">${escapeHtml(opt.text)}</span>
         `;
         answersList.appendChild(card);
     });
@@ -991,13 +1251,27 @@ function submitQuiz(isTimeout = false) {
         passed: passed
     };
     
+    // Разбор ответов: что выбрал пользователь и какие ответы верные
+    const details = activeQuiz.questions.map(q => {
+        const selected = activeQuiz.userAnswers[q.id] || [];
+        return {
+            id: q.id,
+            text: q.text,
+            points: q.points,
+            isCorrect: q.options.every((opt, idx) => !!opt.correct === selected.includes(idx)),
+            videoId: q.linkedVideoId || null,
+            options: q.options.map((opt, idx) => ({ text: opt.text, correct: !!opt.correct, chosen: selected.includes(idx) }))
+        };
+    });
+    lastReview = { result: newResult, details, from: 'result' };
+
     results.push(newResult);
     displayResultSummary(newResult);
 
     fetch('/api/results', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newResult)
+        body: JSON.stringify({ ...newResult, details })
     })
         .then(r => r.ok ? r.json() : Promise.reject(new Error("save failed")))
         .then(data => { if (data && data.result) Object.assign(newResult, data.result); })
@@ -1050,7 +1324,7 @@ function displayResultSummary(result) {
                             <div class="video-result-card">
                                 <div style="flex:1;">
                                     <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Вопрос:</p>
-                                    <p style="font-size: 13px; color: var(--text-primary); font-weight: 500;">${q.text.length > 90 ? q.text.substring(0,90)+'...' : q.text}</p>
+                                    <p style="font-size: 13px; color: var(--text-primary); font-weight: 500;">${escapeHtml(q.text.length > 90 ? q.text.substring(0,90)+'...' : q.text)}</p>
                                 </div>
                                 <button class="btn btn-video-link" onclick="openVideoPlayer('${vm.id}')">
                                     <i class="fa-solid fa-circle-play"></i> ${escapeHtml(vm.title)}
@@ -1191,7 +1465,7 @@ function addOptionRow(text = "", correct = false) {
     
     row.innerHTML = `
         <input type="checkbox" class="option-checkbox" ${correct ? 'checked' : ''} title="Верный ответ">
-        <input type="text" class="form-input option-input" style="padding-left: 16px;" placeholder="Вариант ответа..." value="${text}">
+        <input type="text" class="form-input option-input" style="padding-left: 16px;" placeholder="Вариант ответа..." value="${escapeHtml(text)}">
         <button class="btn-icon btn-icon-danger" onclick="this.parentElement.remove()" style="height: 40px; width: 40px;" title="Удалить вариант"><i class="fa-solid fa-trash"></i></button>
     `;
     container.appendChild(row);
@@ -1534,7 +1808,7 @@ function renderResultsList() {
     );
     
     if (filtered.length === 0) {
-        tableBody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Результаты тестирования пока отсутствуют</td></tr>`;
+        tableBody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">Результаты тестирования пока отсутствуют</td></tr>`;
         return;
     }
     
@@ -1551,6 +1825,7 @@ function renderResultsList() {
             <td><span style="font-weight: 600; color: ${res.passed ? 'var(--success)' : 'var(--accent-orange)'}">${res.percentage}%</span> (${res.earnedScore}/${res.maxScore} б.)</td>
             <td>${res.correctCount} из ${res.totalCount}</td>
             <td><span class="badge ${badgeClass}">${resultLabel}</span></td>
+            <td>${reviewButtonHtml(res, 'results')}</td>
         `;
         tableBody.appendChild(row);
     });
@@ -1566,6 +1841,149 @@ function clearAllResults() {
                 showToast("История очищена", "success");
             })
             .catch(() => showToast("Не удалось очистить историю", "error"));
+    }
+}
+
+// --- Мои результаты и разбор ответов ---
+function reviewButtonHtml(res, from) {
+    if (!res.hasDetails) {
+        return `<span style="color: var(--text-muted); font-size: 12px;" title="Тест пройден до появления разбора">нет данных</span>`;
+    }
+    return `<button class="btn btn-secondary" style="padding: 6px 14px; font-size: 12px; width: fit-content;" onclick="openResultReview('${escapeHtml(res.id)}', '${from}')"><i class="fa-solid fa-list-check"></i> Разбор</button>`;
+}
+
+function renderMyResults() {
+    if (!currentUser) return;
+    const me = currentUser.name.toLowerCase();
+    const mine = results.filter(r => String(r.username).toLowerCase() === me);
+
+    document.getElementById("my-stat-count").textContent = mine.length;
+    const avg = mine.length ? Math.round(mine.reduce((sum, r) => sum + r.percentage, 0) / mine.length) : 0;
+    document.getElementById("my-stat-avg").textContent = avg + "%";
+    document.getElementById("my-stat-passed").textContent = mine.filter(r => r.passed).length;
+
+    const body = document.getElementById("my-results-table-body");
+    body.innerHTML = "";
+    if (mine.length === 0) {
+        body.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Вы ещё не проходили тесты</td></tr>`;
+        return;
+    }
+    [...mine].reverse().forEach(res => {
+        const row = document.createElement("tr");
+        const badgeClass = res.passed ? 'badge-green' : 'badge-orange';
+        row.innerHTML = `
+            <td style="font-weight: 600;">${escapeHtml(res.theme)}</td>
+            <td style="font-size: 13px; color: var(--text-secondary);">${escapeHtml(res.date)}</td>
+            <td><span style="font-weight: 600; color: ${res.passed ? 'var(--success)' : 'var(--accent-orange)'}">${res.percentage}%</span> (${res.earnedScore}/${res.maxScore} б.)</td>
+            <td>${res.correctCount} из ${res.totalCount}</td>
+            <td><span class="badge ${badgeClass}">${res.passed ? 'Пройден' : 'Не сдан'}</span></td>
+            <td>${reviewButtonHtml(res, 'myresults')}</td>
+        `;
+        body.appendChild(row);
+    });
+}
+
+async function openResultReview(id, from) {
+    try {
+        const r = await fetch(`/api/results/${encodeURIComponent(id)}`);
+        const d = await jsonOrNull(r);
+        if (!r.ok || !d || !d.result) {
+            showToast((d && d.error) || "Не удалось открыть разбор", "error");
+            return;
+        }
+        if (!Array.isArray(d.details)) {
+            showToast("Для этого прохождения нет данных о вопросах", "warning");
+            return;
+        }
+        reviewState = { result: d.result, details: d.details, from };
+        document.getElementById("review-only-wrong").checked = false;
+        switchScreen('review');
+        renderReview();
+    } catch (e) {
+        showToast("Ошибка связи с сервером", "error");
+    }
+}
+
+function openLastResultReview() {
+    if (!lastReview) return;
+    reviewState = lastReview;
+    document.getElementById("review-only-wrong").checked = true;
+    switchScreen('review');
+    renderReview();
+}
+
+function closeReview() {
+    const from = (reviewState && reviewState.from) || 'myresults';
+    switchScreen(from);
+}
+
+function renderReview() {
+    if (!reviewState) return;
+    const { result, details } = reviewState;
+    const own = String(result.username).toLowerCase() === currentUser.name.toLowerCase();
+    const onlyWrong = document.getElementById("review-only-wrong").checked;
+    const wrongCount = details.filter(q => !q.isCorrect).length;
+
+    document.getElementById("review-summary").innerHTML = `
+        <div style="display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: center;">
+            <div>
+                <div style="font-size: 18px; font-weight: 700;">${escapeHtml(result.theme)}</div>
+                <div style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">
+                    ${own ? '' : escapeHtml(result.username) + ' · '}${escapeHtml(result.date)}
+                </div>
+            </div>
+            <div style="text-align: right;">
+                <div style="font-size: 26px; font-weight: 700; color: ${result.passed ? 'var(--success)' : 'var(--accent-orange)'};">${result.percentage}%</div>
+                <div style="font-size: 13px; color: var(--text-secondary);">
+                    Верно: ${result.correctCount} из ${result.totalCount} · Ошибок: ${wrongCount}
+                </div>
+            </div>
+        </div>`;
+
+    const list = document.getElementById("review-list");
+    list.innerHTML = "";
+    const who = own ? 'Ваш ответ' : 'Ответ пользователя';
+    let shown = 0;
+
+    details.forEach((q, idx) => {
+        if (onlyWrong && q.isCorrect) return;
+        shown++;
+        const card = document.createElement("div");
+        card.className = "review-q " + (q.isCorrect ? "is-right" : "is-wrong");
+
+        const optsHtml = q.options.map(o => {
+            let cls = '', tag = '', icon = '<i class="fa-regular fa-circle" style="color: var(--text-muted);"></i>';
+            if (o.correct && o.chosen) {
+                cls = 'correct'; tag = `${who} · верно`; icon = '<i class="fa-solid fa-circle-check" style="color: var(--success);"></i>';
+            } else if (o.correct && !o.chosen) {
+                cls = 'correct'; tag = 'Правильный ответ'; icon = '<i class="fa-solid fa-circle-check" style="color: var(--success);"></i>';
+            } else if (!o.correct && o.chosen) {
+                cls = 'wrong'; tag = `${who} · неверно`; icon = '<i class="fa-solid fa-circle-xmark" style="color: var(--error);"></i>';
+            }
+            return `<div class="review-opt ${cls}">${icon}<span>${escapeHtml(o.text)}</span><span class="tag">${tag}</span></div>`;
+        }).join('');
+
+        const vm = q.videoId ? videoMeta.find(v => v.id === q.videoId) : null;
+        const videoHtml = (!q.isCorrect && vm)
+            ? `<button class="btn btn-video-link" style="margin-top: 12px; width: fit-content;" onclick="openVideoPlayer('${vm.id}')"><i class="fa-solid fa-circle-play"></i> ${escapeHtml(vm.title)}</button>`
+            : '';
+        const noAnswer = (!q.isCorrect && !q.options.some(o => o.chosen))
+            ? `<div style="font-size: 12px; color: var(--warning); margin-top: 8px;">Ответ не был выбран</div>` : '';
+
+        card.innerHTML = `
+            <div class="review-q-head">
+                <div class="review-q-text">${idx + 1}. ${escapeHtml(q.text)}</div>
+                <span class="badge ${q.isCorrect ? 'badge-green' : 'badge-orange'}">${q.isCorrect ? 'Верно' : 'Ошибка'}</span>
+            </div>
+            ${optsHtml}
+            ${noAnswer}
+            ${videoHtml}
+        `;
+        list.appendChild(card);
+    });
+
+    if (shown === 0) {
+        list.innerHTML = `<div style="text-align: center; color: var(--success); padding: 40px; font-weight: 600;">Ошибок нет. Все ответы верные!</div>`;
     }
 }
 
